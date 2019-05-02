@@ -1,14 +1,21 @@
 import QUnit from 'qunit';
 import videojs from 'video.js';
+import window from 'global/window';
 import {
   useFakeEnvironment,
   useFakeMediaSource,
   createPlayer,
   standardXHRResponse,
-  openMediaSource
+  openMediaSource,
+  requestAndAppendSegment,
+  setupMediaSource
 } from './test-helpers.js';
 import manifests from './test-manifests.js';
-import { MasterPlaylistController } from '../src/master-playlist-controller';
+import {
+  MasterPlaylistController,
+  DEFAULT_AUDIO_CODEC,
+  DEFAULT_VIDEO_CODEC
+} from '../src/master-playlist-controller';
 /* eslint-disable no-unused-vars */
 // we need this so that it can register hls with videojs
 import { Hls } from '../src/videojs-http-streaming';
@@ -17,7 +24,15 @@ import Playlist from '../src/playlist';
 import Config from '../src/config';
 import PlaylistLoader from '../src/playlist-loader';
 import DashPlaylistLoader from '../src/dash-playlist-loader';
-import { muxed as muxedSegment } from './test-segments';
+import {
+  muxed as muxedSegment,
+  audio as audioSegment,
+  video as videoSegment,
+  mp4VideoInit as mp4VideoInitSegment,
+  mp4Video as mp4VideoSegment,
+  mp4AudioInit as mp4AudioInitSegment,
+  mp4Audio as mp4AudioSegment
+} from './test-segments';
 
 QUnit.module('MasterPlaylistController', {
   beforeEach(assert) {
@@ -44,7 +59,7 @@ QUnit.module('MasterPlaylistController', {
 
       // Because SegmentLoader#fillBuffer_ is now scheduled asynchronously
       // we have to use clock.tick to get the expected side effects of
-      // SegmentLoader#handleUpdateEnd_
+      // SegmentLoader#handleAppendsDone_
       this.clock.tick(1);
     };
 
@@ -159,41 +174,6 @@ QUnit.test('creates appropriate PlaylistLoader for sourceType', function(assert)
 
   assert.ok(mpc.masterPlaylistLoader_ instanceof DashPlaylistLoader,
             'created a dash playlist loader');
-});
-
-QUnit.test('passes options to SegmentLoader', function(assert) {
-  const options = {
-    url: 'test',
-    tech: this.player.tech_
-  };
-
-  let controller = new MasterPlaylistController(options);
-
-  assert.notOk(controller.mainSegmentLoader_.bandwidth, "bandwidth won't be set by default");
-  assert.notOk(controller.mainSegmentLoader_.sourceType_, "sourceType won't be set by default");
-  assert.notOk(controller.mainSegmentLoader_.cacheEncryptionKeys_, "cacheEncryptionKeys won't be set by default");
-
-  controller = new MasterPlaylistController(Object.assign({
-    bandwidth: 3,
-    cacheEncryptionKeys: true,
-    sourceType: 'fake-type'
-  }, options));
-
-  assert.strictEqual(
-    controller.mainSegmentLoader_.bandwidth,
-    3,
-    'bandwidth will be set'
-  );
-  assert.strictEqual(
-    controller.mainSegmentLoader_.sourceType_,
-    'fake-type',
-    'sourceType will be set'
-  );
-  assert.strictEqual(
-    controller.mainSegmentLoader_.cacheEncryptionKeys_,
-    true,
-    'cacheEncryptionKeys will be set'
-  );
 });
 
 QUnit.test('resets SegmentLoader when seeking out of buffer',
@@ -350,6 +330,8 @@ QUnit.test('smooth quality change resyncs audio segment loader', function(assert
 
   masterPlaylistController.mediaSource.trigger('sourceopen');
 
+  this.clock.tick(1);
+
   this.player.audioTracks()[0].enabled = true;
 
   let resyncs = 0;
@@ -370,12 +352,28 @@ QUnit.test('smooth quality change resyncs audio segment loader', function(assert
     return masterPlaylistController.master().playlists[1];
   };
 
-  assert.equal(this.requests.length, 1, 'one request');
+  assert.equal(this.requests.length, 3, 'three requests');
+  assert.ok(this.requests[0].url.endsWith('eng/prog_index.m3u8'),
+            'requests eng playlist');
+  assert.ok(this.requests[1].url.endsWith('lo/main.mp4'), 'correct segment url');
+  assert.equal(this.requests[1].requestHeaders.Range,
+               'bytes=0-603',
+               'requests init segment byte range');
+  assert.ok(this.requests[2].url.endsWith('lo/main.mp4'), 'correct segment url');
+  assert.equal(this.requests[2].requestHeaders.Range,
+               'bytes=604-118754',
+               'requests segment byte range');
+  assert.notOk(this.requests[0].aborted, 'did not abort alt audio playlist request');
+  assert.notOk(this.requests[1].aborted, 'did not abort init request');
+  assert.notOk(this.requests[2].aborted, 'did not abort segment request');
   masterPlaylistController.smoothQualityChange_();
-  assert.equal(this.requests.length, 2, 'added a request for new media');
+  assert.equal(this.requests.length, 4, 'added a request for new media');
+  assert.notOk(this.requests[0].aborted, 'did not abort alt audio playlist request');
+  assert.ok(this.requests[1].aborted, 'aborted init segment request');
+  assert.ok(this.requests[2].aborted, 'aborted segment request');
   assert.equal(resyncs, 0, 'does not resync the audio segment loader yet');
   // new media request
-  this.standardXHRResponse(this.requests[1]);
+  this.standardXHRResponse(this.requests[3]);
   assert.equal(resyncs, 1, 'resyncs the audio segment loader when media changes');
   assert.equal(resets, 0, 'does not reset the audio segment loader when media changes');
 });
@@ -395,6 +393,13 @@ QUnit.test('resets everything for a fast quality change', function(assert) {
 
   segmentLoader.resyncLoader = () => resyncs++;
 
+  const origResetEverything = segmentLoader.resetEverything.bind(segmentLoader);
+
+  segmentLoader.resetEverything = () => {
+    resets++;
+    origResetEverything();
+  };
+
   segmentLoader.remove = function(start, end) {
     removeFuncArgs = {
       start,
@@ -404,16 +409,12 @@ QUnit.test('resets everything for a fast quality change', function(assert) {
 
   segmentLoader.duration_ = () => 60;
 
-  segmentLoader.on('reseteverything', function() {
-    resets++;
-  });
-
   // media is unchanged
   this.masterPlaylistController.fastQualityChange_();
 
   assert.equal(resyncs, 0, 'does not resync segment loader if media is unchanged');
 
-  assert.equal(resets, 0, 'reseteverything event not triggered if media is unchanged');
+  assert.equal(resets, 0, 'resetEverything not called if media is unchanged');
 
   assert.deepEqual(removeFuncArgs, {}, 'remove() not called if media is unchanged');
 
@@ -426,12 +427,13 @@ QUnit.test('resets everything for a fast quality change', function(assert) {
 
   assert.equal(resyncs, 1, 'resynced segment loader if media is changed');
 
-  assert.equal(resets, 1, 'reseteverything event triggered if media is changed');
+  assert.equal(resets, 1, 'resetEverything called if media is changed');
 
   assert.deepEqual(removeFuncArgs, {start: 0, end: 60}, 'remove() called with correct arguments if media is changed');
 });
 
-QUnit.test('seeks in place for fast quality switch on non-IE/Edge browsers', function(assert) {
+QUnit.test('seeks in place for fast quality switch on non-IE/Edge browsers',
+async function(assert) {
   let seeks = 0;
 
   this.masterPlaylistController.mediaSource.trigger('sourceopen');
@@ -439,10 +441,14 @@ QUnit.test('seeks in place for fast quality switch on non-IE/Edge browsers', fun
   this.standardXHRResponse(this.requests.shift());
   // media
   this.standardXHRResponse(this.requests.shift());
-  // segment
-  this.standardXHRResponse(this.requests.shift());
-  // trigger updateend to indicate the end of the append operation
-  this.masterPlaylistController.mediaSource.sourceBuffers[0].trigger('updateend');
+
+  const segmentLoader = this.masterPlaylistController.mainSegmentLoader_;
+
+  await requestAndAppendSegment({
+    request: this.requests.shift(),
+    segmentLoader,
+    clock: this.clock
+  });
 
   // media is changed
   this.masterPlaylistController.selectPlaylist = () => {
@@ -455,16 +461,25 @@ QUnit.test('seeks in place for fast quality switch on non-IE/Edge browsers', fun
 
   const timeBeforeSwitch = this.player.currentTime();
 
+  // mock buffered values so removes are processed
+  segmentLoader.sourceUpdater_.audioBuffer.buffered = videojs.createTimeRanges([[0, 10]]);
+  segmentLoader.sourceUpdater_.videoBuffer.buffered = videojs.createTimeRanges([[0, 10]]);
+
   this.masterPlaylistController.fastQualityChange_();
   // trigger updateend to indicate the end of the remove operation
-  this.masterPlaylistController.mediaSource.sourceBuffers[0].trigger('updateend');
+  segmentLoader.sourceUpdater_.audioBuffer.trigger('updateend');
+  segmentLoader.sourceUpdater_.videoBuffer.trigger('updateend');
   this.clock.tick(1);
 
-  assert.equal(this.player.currentTime(), timeBeforeSwitch, 'current time remains the same on fast quality switch');
+  assert.equal(
+    this.player.currentTime(),
+    timeBeforeSwitch,
+    'current time remains the same on fast quality switch');
   assert.equal(seeks, 1, 'seek event occurs on fast quality switch');
 });
 
-QUnit.test('seeks forward 0.04 sec for fast quality switch on Edge', function(assert) {
+QUnit.test('seeks forward 0.04 sec for fast quality switch on Edge',
+async function(assert) {
   let oldIEVersion = videojs.browser.IE_VERSION;
   let oldIsEdge = videojs.browser.IS_EDGE;
   let seeks = 0;
@@ -474,10 +489,14 @@ QUnit.test('seeks forward 0.04 sec for fast quality switch on Edge', function(as
   this.standardXHRResponse(this.requests.shift());
   // media
   this.standardXHRResponse(this.requests.shift());
-  // segment
-  this.standardXHRResponse(this.requests.shift());
-  // trigger updateend to indicate the end of the append operation
-  this.masterPlaylistController.mediaSource.sourceBuffers[0].trigger('updateend');
+
+  const segmentLoader = this.masterPlaylistController.mainSegmentLoader_;
+
+  await requestAndAppendSegment({
+    request: this.requests.shift(),
+    segmentLoader,
+    clock: this.clock
+  });
 
   // media is changed
   this.masterPlaylistController.selectPlaylist = () => {
@@ -493,19 +512,28 @@ QUnit.test('seeks forward 0.04 sec for fast quality switch on Edge', function(as
   videojs.browser.IE_VERSION = null;
   videojs.browser.IS_EDGE = true;
 
+  // mock buffered values so removes are processed
+  segmentLoader.sourceUpdater_.audioBuffer.buffered = videojs.createTimeRanges([[0, 10]]);
+  segmentLoader.sourceUpdater_.videoBuffer.buffered = videojs.createTimeRanges([[0, 10]]);
+
   this.masterPlaylistController.fastQualityChange_();
   // trigger updateend to indicate the end of the remove operation
-  this.masterPlaylistController.mediaSource.sourceBuffers[0].trigger('updateend');
+  segmentLoader.sourceUpdater_.audioBuffer.trigger('updateend');
+  segmentLoader.sourceUpdater_.videoBuffer.trigger('updateend');
   this.clock.tick(1);
 
-  assert.equal(this.player.currentTime(), timeBeforeSwitch + 0.04, 'seeks forward on fast quality switch');
+  assert.equal(
+    this.player.currentTime(),
+    timeBeforeSwitch + 0.04,
+    'seeks forward on fast quality switch');
   assert.equal(seeks, 1, 'seek event occurs on fast quality switch');
 
   videojs.browser.IE_VERSION = oldIEVersion;
   videojs.browser.IS_EDGE = oldIsEdge;
 });
 
-QUnit.test('seeks forward 0.04 sec for fast quality switch on IE', function(assert) {
+QUnit.test('seeks forward 0.04 sec for fast quality switch on IE',
+async function(assert) {
   let oldIEVersion = videojs.browser.IE_VERSION;
   let oldIsEdge = videojs.browser.IS_EDGE;
   let seeks = 0;
@@ -515,10 +543,14 @@ QUnit.test('seeks forward 0.04 sec for fast quality switch on IE', function(asse
   this.standardXHRResponse(this.requests.shift());
   // media
   this.standardXHRResponse(this.requests.shift());
-  // segment
-  this.standardXHRResponse(this.requests.shift());
-  // trigger updateend to indicate the end of the append operation
-  this.masterPlaylistController.mediaSource.sourceBuffers[0].trigger('updateend');
+
+  const segmentLoader = this.masterPlaylistController.mainSegmentLoader_;
+
+  await requestAndAppendSegment({
+    request: this.requests.shift(),
+    segmentLoader,
+    clock: this.clock
+  });
 
   // media is changed
   this.masterPlaylistController.selectPlaylist = () => {
@@ -534,12 +566,20 @@ QUnit.test('seeks forward 0.04 sec for fast quality switch on IE', function(asse
   videojs.browser.IE_VERSION = 11;
   videojs.browser.IS_EDGE = false;
 
+  // mock buffered values so removes are processed
+  segmentLoader.sourceUpdater_.audioBuffer.buffered = videojs.createTimeRanges([[0, 10]]);
+  segmentLoader.sourceUpdater_.videoBuffer.buffered = videojs.createTimeRanges([[0, 10]]);
+
   this.masterPlaylistController.fastQualityChange_();
   // trigger updateend to indicate the end of the remove operation
-  this.masterPlaylistController.mediaSource.sourceBuffers[0].trigger('updateend');
+  segmentLoader.sourceUpdater_.audioBuffer.trigger('updateend');
+  segmentLoader.sourceUpdater_.videoBuffer.trigger('updateend');
   this.clock.tick(1);
 
-  assert.equal(this.player.currentTime(), timeBeforeSwitch + 0.04, 'seeks forward on fast quality switch');
+  assert.equal(
+    this.player.currentTime(),
+    timeBeforeSwitch + 0.04,
+    'seeks forward on fast quality switch');
   assert.equal(seeks, 1, 'seek event occurs on fast quality switch');
 
   videojs.browser.IE_VERSION = oldIEVersion;
@@ -579,17 +619,35 @@ QUnit.test('audio segment loader is reset on audio track change', function(asser
   };
   masterPlaylistController.audioSegmentLoader_.resyncLoader = () => resyncs++;
 
-  assert.equal(this.requests.length, 1, 'one request');
+  assert.equal(this.requests.length, 3, 'three requests');
+  assert.ok(this.requests[0].url.endsWith('eng/prog_index.m3u8'),
+            'requests eng playlist');
+  assert.ok(this.requests[1].url.endsWith('lo/main.mp4'), 'correct segment url');
+  assert.equal(this.requests[1].requestHeaders.Range,
+               'bytes=0-603',
+               'requests init segment byte range');
+  assert.ok(this.requests[2].url.endsWith('lo/main.mp4'), 'correct segment url');
+  assert.equal(this.requests[2].requestHeaders.Range,
+               'bytes=604-118754',
+               'requests segment byte range');
+  assert.notOk(this.requests[0].aborted, 'did not abort alt audio playlist request');
+  assert.notOk(this.requests[1].aborted, 'did not abort init request');
+  assert.notOk(this.requests[2].aborted, 'did not abort segment request');
   assert.equal(resyncs, 0, 'does not resync the audio segment loader yet');
 
   this.player.audioTracks()[1].enabled = true;
 
-  assert.equal(this.requests.length, 2, 'two requests');
+  assert.equal(this.requests.length, 4, 'added a request for new media');
+  assert.ok(this.requests[0].aborted, 'aborted old alt audio playlist request');
+  assert.notOk(this.requests[1].aborted, 'did not abort init request');
+  assert.notOk(this.requests[2].aborted, 'did not abort segment request');
+  assert.ok(this.requests[3].url.endsWith('esp/prog_index.m3u8'),
+            'requests esp playlist');
   assert.equal(resyncs, 1, 'resyncs the audio segment loader when audio track changes');
   assert.equal(resets, 1, 'resets the audio segment loader when audio track changes');
 });
 
-QUnit.test('if buffered, will request second segment byte range', function(assert) {
+QUnit.test('if buffered, will request second segment byte range', async function(assert) {
   this.requests.length = 0;
   this.player.src({
     src: 'manifest/playlist.m3u8',
@@ -616,23 +674,20 @@ QUnit.test('if buffered, will request second segment byte range', function(asser
   this.masterPlaylistController.mainSegmentLoader_.sourceUpdater_.buffered = () => {
     return videojs.createTimeRanges([[0, 20]]);
   };
-  // 1ms has passed to upload 1kb
-  // that gives us a bandwidth of 1024 / 1 * 8 * 1000 = 8192000
   this.clock.tick(1);
   // segment
-  this.standardXHRResponse(this.requests[1]);
+  this.standardXHRResponse(this.requests[1], muxedSegment());
+  await new Promise((accept, reject) => {
+    this.masterPlaylistController.mainSegmentLoader_.on('appending', accept);
+  });
   this.masterPlaylistController.mainSegmentLoader_.fetchAtBuffer_ = true;
+  // source buffers are mocked, so must manually trigger update ends on audio and video
+  // buffers
   this.masterPlaylistController.mediaSource.sourceBuffers[0].trigger('updateend');
+  this.masterPlaylistController.mediaSource.sourceBuffers[1].trigger('updateend');
   this.clock.tick(10 * 1000);
   this.clock.tick(1);
   assert.equal(this.requests[2].headers.Range, 'bytes=522828-1110327');
-
-  // verify stats
-  assert.equal(this.player.tech_.hls.stats.bandwidth, 8192000, 'Live stream');
-  assert.equal(this.player.tech_.hls.stats.mediaRequests, 1, '1 segment request');
-  assert.equal(this.player.tech_.hls.stats.mediaBytesTransferred,
-               1024,
-               '1024 bytes downloaded');
 });
 
 QUnit.test('re-initializes the combined playlist loader when switching sources',
@@ -714,20 +769,13 @@ function(assert) {
   this.player.tech_.on('progress', function() {
     progressCount++;
   });
-  // 1ms has passed to upload 1kb
-  // that gives us a bandwidth of 1024 / 1 * 8 * 1000 = 8192000
+
+  // 1ms for request duration
   this.clock.tick(1);
-  // segment
-  this.standardXHRResponse(this.requests.shift());
+  this.standardXHRResponse(this.requests.shift(), muxedSegment());
+
   this.masterPlaylistController.mainSegmentLoader_.trigger('progress');
   assert.equal(progressCount, 1, 'fired a progress event');
-
-  // verify stats
-  assert.equal(this.player.tech_.hls.stats.bandwidth, 8192000, 'Live stream');
-  assert.equal(this.player.tech_.hls.stats.mediaRequests, 1, '1 segment request');
-  assert.equal(this.player.tech_.hls.stats.mediaBytesTransferred,
-               1024,
-               '1024 bytes downloaded');
 });
 
 QUnit.test('updates the active loader when switching from unmuxed to muxed audio group',
@@ -766,7 +814,7 @@ function(assert) {
 });
 
 QUnit.test('waits for both main and audio loaders to finish before calling endOfStream',
-function(assert) {
+async function(assert) {
   openMediaSource(this.player, this.clock);
 
   const videoMedia = '#EXTM3U\n' +
@@ -795,8 +843,8 @@ function(assert) {
   MPC.mainSegmentLoader_.on('ended', () => videoEnded++);
   MPC.audioSegmentLoader_.on('ended', () => audioEnded++);
 
-  MPC.mainSegmentLoader_.startingMedia_ = { containsVideo: true };
-  MPC.audioSegmentLoader_.startingMedia_ = { containsAudio: true };
+  MPC.mainSegmentLoader_.startingMedia_ = { hasVideo: true };
+  MPC.audioSegmentLoader_.startingMedia_ = { hasAudio: true };
 
   // master
   this.standardXHRResponse(this.requests.shift(), manifests.demuxed);
@@ -807,151 +855,40 @@ function(assert) {
   // audio media
   this.standardXHRResponse(this.requests.shift(), audioMedia);
 
-  // video segment
-  this.standardXHRResponse(this.requests.shift(), muxedSegment());
-  // source buffer is mocked, so must manually trigger the video buffer
-  // video buffer is the first buffer created
-  MPC.mediaSource.sourceBuffers[0].trigger('updateend');
+  await requestAndAppendSegment({
+    request: this.requests.shift(),
+    segment: videoSegment(),
+    isOnlyVideo: true,
+    segmentLoader: MPC.mainSegmentLoader_,
+    clock: this.clock
+  });
 
   assert.equal(videoEnded, 1, 'main segment loader triggered ended');
   assert.equal(audioEnded, 0, 'audio segment loader did not trigger ended');
   assert.equal(MPC.mediaSource.readyState, 'open', 'Media Source not yet ended');
 
-  // audio segment
-  this.standardXHRResponse(this.requests.shift(), muxedSegment());
-  // source buffer is mocked, so must manually trigger the audio buffer
-  // audio buffer is the second buffer created
-  MPC.mediaSource.sourceBuffers[1].trigger('updateend');
+  await requestAndAppendSegment({
+    request: this.requests.shift(),
+    segment: audioSegment(),
+    isOnlyAudio: true,
+    segmentLoader: MPC.audioSegmentLoader_,
+    clock: this.clock
+  });
 
   assert.equal(videoEnded, 1, 'main segment loader did not trigger ended again');
   assert.equal(audioEnded, 1, 'audio segment loader triggered ended');
   assert.equal(MPC.mediaSource.readyState, 'ended', 'Media Source ended');
 });
 
-QUnit.test('waits for both main and audio loaders to finish before calling endOfStream' +
-' if main loader starting media is unknown', function(assert) {
-  openMediaSource(this.player, this.clock);
-
-  const videoMedia = '#EXTM3U\n' +
-                     '#EXT-X-VERSION:3\n' +
-                     '#EXT-X-PLAYLIST-TYPE:VOD\n' +
-                     '#EXT-X-MEDIA-SEQUENCE:0\n' +
-                     '#EXT-X-TARGETDURATION:10\n' +
-                     '#EXTINF:10,\n' +
-                     'video-0.ts\n' +
-                     '#EXT-X-ENDLIST\n';
-
-  const audioMedia = '#EXTM3U\n' +
-                     '#EXT-X-VERSION:3\n' +
-                     '#EXT-X-PLAYLIST-TYPE:VOD\n' +
-                     '#EXT-X-MEDIA-SEQUENCE:0\n' +
-                     '#EXT-X-TARGETDURATION:10\n' +
-                     '#EXTINF:10,\n' +
-                     'audio-0.ts\n' +
-                     '#EXT-X-ENDLIST\n';
-
-  let videoEnded = 0;
-  let audioEnded = 0;
-
-  const MPC = this.masterPlaylistController;
-
-  MPC.mainSegmentLoader_.on('ended', () => videoEnded++);
-  MPC.audioSegmentLoader_.on('ended', () => audioEnded++);
-
-  MPC.audioSegmentLoader_.startingMedia_ = { containsAudio: true };
-
-  // master
-  this.standardXHRResponse(this.requests.shift(), manifests.demuxed);
-
-  // video media
-  this.standardXHRResponse(this.requests.shift(), videoMedia);
-
-  // audio media
-  this.standardXHRResponse(this.requests.shift(), audioMedia);
-
-  // this.requests === [videoSegment, audioSegment]
-
-  // audio segment
-  this.standardXHRResponse(this.requests[1]);
-  // audio source buffer
-  MPC.mediaSource.sourceBuffers[1].trigger('updateend');
-
-  assert.equal(videoEnded, 0, 'main segment loader did not trigger ended');
-  assert.equal(audioEnded, 1, 'audio segment loader triggered ended');
-  assert.equal(MPC.mediaSource.readyState, 'open', 'Media Source not yet ended');
-
-  // video segment
-  this.standardXHRResponse(this.requests[0]);
-
-  MPC.mainSegmentLoader_.startingMedia_ = { containsVideo: true };
-  // main source buffer
-  MPC.mediaSource.sourceBuffers[0].trigger('updateend');
-
-  assert.equal(videoEnded, 1, 'main segment loader triggered ended');
-  assert.equal(audioEnded, 1, 'audio segment loader did not trigger ended again');
-  assert.equal(MPC.mediaSource.readyState, 'ended', 'Media Source ended');
-});
-
-QUnit.test('does not wait for main loader to finish before calling endOfStream with' +
-' audio only stream and alternate audio active', function(assert) {
-  openMediaSource(this.player, this.clock);
-
-  const mainMedia = '#EXTM3U\n' +
-                    '#EXT-X-VERSION:3\n' +
-                    '#EXT-X-PLAYLIST-TYPE:VOD\n' +
-                    '#EXT-X-MEDIA-SEQUENCE:0\n' +
-                    '#EXT-X-TARGETDURATION:10\n' +
-                    '#EXTINF:10,\n' +
-                    'audio-0.ts\n' +
-                    '#EXT-X-ENDLIST\n';
-
-  const audioMedia = '#EXTM3U\n' +
-                    '#EXT-X-VERSION:3\n' +
-                    '#EXT-X-PLAYLIST-TYPE:VOD\n' +
-                    '#EXT-X-MEDIA-SEQUENCE:0\n' +
-                    '#EXT-X-TARGETDURATION:10\n' +
-                    '#EXTINF:10,\n' +
-                    'audio-0.ts\n' +
-                    '#EXT-X-ENDLIST\n';
-
-  let mainEnded = 0;
-  let audioEnded = 0;
-
-  const MPC = this.masterPlaylistController;
-
-  MPC.mainSegmentLoader_.on('ended', () => mainEnded++);
-  MPC.audioSegmentLoader_.on('ended', () => audioEnded++);
-
-  MPC.mainSegmentLoader_.startingMedia_ = { containsAudio: true };
-  MPC.audioSegmentLoader_.startingMedia_ = { containsAudio: true };
-
-  // master
-  this.standardXHRResponse(this.requests.shift(), manifests.audioOnlyAlternateAudio);
-
-  // main media
-  this.standardXHRResponse(this.requests.shift(), mainMedia);
-
-  this.player.audioTracks()[0].enabled = false;
-  this.player.audioTracks()[1].enabled = true;
-
-  // main segment
-  this.standardXHRResponse(this.requests.shift());
-
-  // audio media
-  this.standardXHRResponse(this.requests.shift(), audioMedia);
-
-  // audio segment
-  this.standardXHRResponse(this.requests.shift());
-
-  MPC.mediaSource.sourceBuffers[1].trigger('updateend');
-
-  assert.equal(mainEnded, 0, 'main segment loader did not trigger ended');
-  assert.equal(audioEnded, 1, 'audio segment loader triggered ended');
-  assert.equal(MPC.mediaSource.readyState, 'ended', 'Media Source ended');
-});
+// TODO once we have support for audio only with alternate audio, we should have a test
+// for: "does not wait for main loader to finish before calling endOfStream with audio
+// only stream and alternate audio active." This will require changes in segment loader to
+// handle disabled audio on the main stream, as well as potential media group changes and
+// master playlist controller changes to use measurements from the audio segment loader as
+// the primary source when main is disabled.
 
 QUnit.test('Segment loaders are unpaused when seeking after player has ended',
-function(assert) {
+async function(assert) {
   openMediaSource(this.player, this.clock);
 
   const videoMedia = '#EXTM3U\n' +
@@ -976,12 +913,19 @@ function(assert) {
   this.standardXHRResponse(this.requests.shift(), videoMedia);
 
   // segment
-  this.standardXHRResponse(this.requests.shift());
+  this.standardXHRResponse(this.requests.shift(), muxedSegment());
+
+  await new Promise((accept, reject) => {
+    this.masterPlaylistController.mainSegmentLoader_.on('appending', accept);
+  });
 
   assert.notOk(this.masterPlaylistController.mainSegmentLoader_.paused(),
     'segment loader not yet paused');
 
+  // source buffers are mocked, so must manually trigger update ends on audio and video
+  // buffers
   this.masterPlaylistController.mediaSource.sourceBuffers[0].trigger('updateend');
+  this.masterPlaylistController.mediaSource.sourceBuffers[1].trigger('updateend');
 
   assert.ok(this.masterPlaylistController.mainSegmentLoader_.paused(),
     'segment loader is paused after ending');
@@ -1060,9 +1004,7 @@ QUnit.test('detects if the player is stuck at the playlist end', function(assert
 });
 
 QUnit.test('blacklists switching from video+audio playlists to audio only',
-function(assert) {
-  let audioPlaylist;
-
+async function(assert) {
   openMediaSource(this.player, this.clock);
 
   this.player.tech_.hls.bandwidth = 1e10;
@@ -1077,23 +1019,30 @@ function(assert) {
   // media1
   this.standardXHRResponse(this.requests.shift());
 
-  assert.equal(this.masterPlaylistController.masterPlaylistLoader_.media(),
-              this.masterPlaylistController.masterPlaylistLoader_.master.playlists[1],
-              'selected video+audio');
-  audioPlaylist = this.masterPlaylistController.masterPlaylistLoader_.master.playlists[0];
-  assert.equal(audioPlaylist.excludeUntil, Infinity, 'excluded incompatible playlist');
+  const mpc = this.masterPlaylistController;
 
-  // verify stats
-  assert.equal(this.player.tech_.hls.stats.bandwidth, 1e10, 'bandwidth we set above');
+  // segment must be appended before the blacklist logic runs
+  await requestAndAppendSegment({
+    request: this.requests.shift(),
+    segmentLoader: mpc.mainSegmentLoader_,
+    clock: this.clock
+  });
+
+  assert.equal(mpc.masterPlaylistLoader_.media(),
+               mpc.masterPlaylistLoader_.master.playlists[1],
+               'selected video+audio');
+
+  const audioPlaylist = mpc.masterPlaylistLoader_.master.playlists[0];
+
+  assert.equal(audioPlaylist.excludeUntil, Infinity, 'excluded incompatible playlist');
 });
 
 QUnit.test('blacklists switching from audio-only playlists to video+audio',
-function(assert) {
-  let videoAudioPlaylist;
-
+async function(assert) {
   openMediaSource(this.player, this.clock);
 
   this.player.tech_.hls.bandwidth = 1;
+
   // master
   this.requests.shift().respond(200, null,
                                 '#EXTM3U\n' +
@@ -1104,26 +1053,35 @@ function(assert) {
 
   // media1
   this.standardXHRResponse(this.requests.shift());
-  assert.equal(this.masterPlaylistController.masterPlaylistLoader_.media(),
-              this.masterPlaylistController.masterPlaylistLoader_.master.playlists[0],
-              'selected audio only');
-  videoAudioPlaylist =
-    this.masterPlaylistController.masterPlaylistLoader_.master.playlists[1];
+
+  const mpc = this.masterPlaylistController;
+
+  // segment must be appended before the blacklist logic runs
+  await requestAndAppendSegment({
+    request: this.requests.shift(),
+    segmentLoader: mpc.mainSegmentLoader_,
+    segment: audioSegment(),
+    isOnlyAudio: true,
+    clock: this.clock
+  });
+
+  assert.equal(mpc.masterPlaylistLoader_.media(),
+               mpc.masterPlaylistLoader_.master.playlists[0],
+               'selected audio only');
+
+  const videoAudioPlaylist = mpc.masterPlaylistLoader_.master.playlists[1];
+
   assert.equal(videoAudioPlaylist.excludeUntil,
               Infinity,
               'excluded incompatible playlist');
-
-  // verify stats
-  assert.equal(this.player.tech_.hls.stats.bandwidth, 1, 'bandwidth we set above');
 });
 
 QUnit.test('blacklists switching from video-only playlists to video+audio',
-function(assert) {
-  let videoAudioPlaylist;
-
+async function(assert) {
   openMediaSource(this.player, this.clock);
 
   this.player.tech_.hls.bandwidth = 1;
+
   // master
   this.requests.shift()
     .respond(200, null,
@@ -1135,26 +1093,35 @@ function(assert) {
 
   // media
   this.standardXHRResponse(this.requests.shift());
-  assert.equal(this.masterPlaylistController.masterPlaylistLoader_.media(),
-              this.masterPlaylistController.masterPlaylistLoader_.master.playlists[0],
-              'selected video only');
-  videoAudioPlaylist =
-    this.masterPlaylistController.masterPlaylistLoader_.master.playlists[1];
+
+  const mpc = this.masterPlaylistController;
+
+  // segment must be appended before the blacklist logic runs
+  await requestAndAppendSegment({
+    request: this.requests.shift(),
+    segmentLoader: mpc.mainSegmentLoader_,
+    segment: videoSegment(),
+    isOnlyVideo: true,
+    clock: this.clock
+  });
+
+  assert.equal(mpc.masterPlaylistLoader_.media(),
+               mpc.masterPlaylistLoader_.master.playlists[0],
+               'selected video only');
+
+  const videoAudioPlaylist = mpc.masterPlaylistLoader_.master.playlists[1];
+
   assert.equal(videoAudioPlaylist.excludeUntil,
               Infinity,
               'excluded incompatible playlist');
-
-  // verify stats
-  assert.equal(this.player.tech_.hls.stats.bandwidth, 1, 'bandwidth we set above');
 });
 
 QUnit.test('does not blacklist switching between playlists with different audio profiles',
-function(assert) {
-  let alternatePlaylist;
-
+async function(assert) {
   openMediaSource(this.player, this.clock);
 
   this.player.tech_.hls.bandwidth = 1;
+
   // master
   this.requests.shift()
     .respond(200, null,
@@ -1169,13 +1136,19 @@ function(assert) {
   assert.equal(this.masterPlaylistController.masterPlaylistLoader_.media(),
               this.masterPlaylistController.masterPlaylistLoader_.master.playlists[0],
               'selected HE-AAC stream');
-  alternatePlaylist =
-    this.masterPlaylistController.masterPlaylistLoader_.master.playlists[1];
-  assert.equal(alternatePlaylist.excludeUntil,
-               undefined,
-               'not excluded playlist');
-  // verify stats
-  assert.equal(this.player.tech_.hls.stats.bandwidth, 1, 'bandwidth we set above');
+
+  const mpc = this.masterPlaylistController;
+
+  // segment must be appended before the blacklist logic runs
+  await requestAndAppendSegment({
+    request: this.requests.shift(),
+    segmentLoader: mpc.mainSegmentLoader_,
+    clock: this.clock
+  });
+
+  const alternatePlaylist = mpc.masterPlaylistLoader_.master.playlists[1];
+
+  assert.equal(alternatePlaylist.excludeUntil, undefined, 'did not exclude playlist');
 });
 
 QUnit.test('blacklists playlists with unsupported codecs before initial selection',
@@ -1201,7 +1174,8 @@ function(assert) {
   this.standardXHRResponse(this.requests.shift());
 });
 
-QUnit.test('updates the combined segment loader on media changes', function(assert) {
+QUnit.test('updates the combined segment loader on media changes',
+async function(assert) {
   let updates = [];
 
   this.masterPlaylistController.mediaSource.trigger('sourceopen');
@@ -1221,26 +1195,44 @@ QUnit.test('updates the combined segment loader on media changes', function(asse
   this.clock.tick(1);
 
   this.masterPlaylistController.mainSegmentLoader_.mediaIndex = 0;
+
+  const segment = muxedSegment();
+  // copy the byte length since the segment bytes get cleared out
+  const segmentByteLength = segment.byteLength;
+
+  assert.ok(segmentByteLength, 'the segment has some number of bytes');
+
   // downloading the new segment will update bandwidth and cause a
   // playlist change
   // segment 0
-  this.standardXHRResponse(this.requests.shift());
+  this.standardXHRResponse(this.requests.shift(), segment);
   // update the buffer to reflect the appended segment, and have enough buffer to
   // change playlist
   this.masterPlaylistController.tech_.buffered = () => {
     return videojs.createTimeRanges([[0, 30]]);
   };
+
+  await new Promise((accept, reject) => {
+    this.masterPlaylistController.mainSegmentLoader_.on('appending', accept);
+  });
+
+  // source buffers are mocked, so must manually trigger update ends on audio and video
+  // buffers
   this.masterPlaylistController.mediaSource.sourceBuffers[0].trigger('updateend');
+  this.masterPlaylistController.mediaSource.sourceBuffers[1].trigger('updateend');
   // media
   this.standardXHRResponse(this.requests.shift());
   assert.ok(updates.length > 0, 'updated the segment list');
 
   // verify stats
-  assert.equal(this.player.tech_.hls.stats.bandwidth, 8192000, 'Live stream');
+  // request duration was 1ms, giving a bandwidth of bytes / 1 * 8 * 1000
+  assert.equal(this.player.tech_.hls.stats.bandwidth,
+               segmentByteLength / 1 * 8 * 1000,
+               'stats has the right bandwidth');
   assert.equal(this.player.tech_.hls.stats.mediaRequests, 1, '1 segment request');
   assert.equal(this.player.tech_.hls.stats.mediaBytesTransferred,
-               1024,
-               '1024 bytes downloaded');
+               segmentByteLength,
+               'stats has the right number of bytes transferred');
 });
 
 QUnit.test('selects a playlist after main/combined segment downloads', function(assert) {
@@ -1496,7 +1488,7 @@ QUnit.test('blacklists playlist on earlyabort', function(assert) {
   assert.equal(mediaChanges.length, 1, 'one media change');
   assert.equal(warnings.length, 1, 'one warning logged');
   assert.equal(warnings[0],
-               'Problem encountered with the current HLS playlist. ' +
+               'Problem encountered with the current playlist. ' +
                  'Aborted early because there isn\'t enough bandwidth to complete the ' +
                  'request without rebuffering. Switching to another playlist.',
                'warning message is correct');
@@ -1505,7 +1497,7 @@ QUnit.test('blacklists playlist on earlyabort', function(assert) {
 });
 
 QUnit.test('does not get stuck in a loop due to inconsistent network/caching',
-function(assert) {
+async function(assert) {
   /*
    * This test is a long one, but it is meant to follow a true path to a possible loop.
    * The reason for the loop is due to inconsistent network bandwidth, often caused or
@@ -1535,14 +1527,14 @@ function(assert) {
     '#EXTINF:10\n' +
     '3.ts\n' +
     '#EXT-X-ENDLIST\n';
-
-  const segmentLoader = this.masterPlaylistController.mainSegmentLoader_;
+  const mpc = this.masterPlaylistController;
+  const segmentLoader = mpc.mainSegmentLoader_;
 
   // start on lowest bandwidth rendition (will be media.m3u8)
   segmentLoader.bandwidth = 0;
 
   this.player.tech_.paused = () => false;
-  this.masterPlaylistController.mediaSource.trigger('sourceopen');
+  mpc.mediaSource.trigger('sourceopen');
   // master
   this.requests.shift().respond(200, null,
                                 '#EXTM3U\n' +
@@ -1553,11 +1545,11 @@ function(assert) {
   // media.m3u8
   this.requests.shift().respond(200, null, mediaContents);
 
-  let playlistLoader = this.masterPlaylistController.masterPlaylistLoader_;
+  let playlistLoader = mpc.masterPlaylistLoader_;
   let origMedia = playlistLoader.media.bind(playlistLoader);
   let mediaChanges = [];
 
-  this.masterPlaylistController.masterPlaylistLoader_.media = (media) => {
+  mpc.masterPlaylistLoader_.media = (media) => {
     if (media) {
       mediaChanges.push(media);
     }
@@ -1572,13 +1564,13 @@ function(assert) {
                '0.ts',
                'requested first segment');
 
-  // 100ms for the segment response
-  this.clock.tick(100);
-  // 10 bytes in 100ms = 800 bits/s
-  this.requests[0].response = new Uint8Array(10).buffer;
-  this.requests.shift().respond(200, null, '');
-  segmentLoader.mediaSource_.sourceBuffers[0].trigger('updateend');
-  this.clock.tick(1);
+  await requestAndAppendSegment({
+    request: this.requests.shift(),
+    segmentLoader: mpc.mainSegmentLoader_,
+    clock: this.clock,
+    bandwidth: 800
+  });
+
   segmentRequest = this.requests[0];
 
   // should be walking forwards (need two segments before we can switch)
@@ -1588,13 +1580,12 @@ function(assert) {
                'requested second segment');
   assert.equal(mediaChanges.length, 0, 'no media changes');
 
-  // 100ms for the segment response
-  this.clock.tick(100);
-  // 11 bytes in 100ms = 880 bits/s
-  this.requests[0].response = new Uint8Array(11).buffer;
-  this.requests.shift().respond(200, null, '');
-  segmentLoader.mediaSource_.sourceBuffers[0].trigger('updateend');
-  this.clock.tick(1);
+  await requestAndAppendSegment({
+    request: this.requests.shift(),
+    segmentLoader: mpc.mainSegmentLoader_,
+    clock: this.clock,
+    bandwidth: 880
+  });
 
   let mediaRequest = this.requests[0];
 
@@ -1656,15 +1647,18 @@ function(assert) {
   this.requests.shift();
   // 1ms for the cached segment response
   this.clock.tick(1);
-  // 10 bytes in 1ms = 80 kbps
-  this.requests[0].response = new Uint8Array(10).buffer;
-  this.requests.shift().respond(200, null, '');
-  segmentLoader.mediaSource_.sourceBuffers[0].trigger('updateend');
-  this.clock.tick(1);
+
+  await requestAndAppendSegment({
+    request: this.requests.shift(),
+    segmentLoader: mpc.mainSegmentLoader_,
+    clock: this.clock,
+    bandwidth: 80000
+  });
+
   segmentRequest = this.requests[0];
 
   // walking forwards, still need two segments before trying to change rendition
-  assert.equal(segmentLoader.bandwidth, 80000, 'bandwidth is correct');
+  assert.bandwidthWithinTolerance(segmentLoader.bandwidth, 80000, 'bandwidth is correct');
   assert.equal(mediaChanges.length, 2, 'did not change media');
   assert.equal(segmentRequest.uri.substring(segmentRequest.uri.length - 4),
                '1.ts',
@@ -1672,15 +1666,17 @@ function(assert) {
 
   // 1ms for the cached segment response
   this.clock.tick(1);
-  // 11 bytes in 1ms = 88 kbps
-  this.requests[0].response = new Uint8Array(11).buffer;
-  this.requests.shift().respond(200, null, '');
-  segmentLoader.mediaSource_.sourceBuffers[0].trigger('updateend');
-  this.clock.tick(1);
+
+  await requestAndAppendSegment({
+    request: this.requests.shift(),
+    segmentLoader: mpc.mainSegmentLoader_,
+    clock: this.clock,
+    bandwidth: 88000
+  });
 
   // Media may be changed, but it should be changed to the same media. In the future, this
   // can safely not be changed.
-  assert.equal(segmentLoader.bandwidth, 88000, 'bandwidth is correct');
+  assert.bandwidthWithinTolerance(segmentLoader.bandwidth, 88000, 'bandwidth is correct');
   assert.equal(mediaChanges.length, 3, 'changed media');
   assert.equal(mediaChanges[2].uri, 'media.m3u8', 'media remains unchanged');
 
@@ -1693,11 +1689,13 @@ function(assert) {
   this.env.log.warn.callCount = 0;
 });
 
-QUnit.test('updates the duration after switching playlists', function(assert) {
+QUnit.test('updates the duration after switching playlists', async function(assert) {
+  const segment = muxedSegment();
+  // copy the byte length since the segment bytes get cleared out
+  const segmentByteLength = segment.byteLength;
   let selectedPlaylist = false;
 
   this.masterPlaylistController.mediaSource.trigger('sourceopen');
-
   this.masterPlaylistController.bandwidth = 1e20;
 
   // master
@@ -1714,13 +1712,24 @@ QUnit.test('updates the duration after switching playlists', function(assert) {
 
     return this.masterPlaylistController.masterPlaylistLoader_.master.playlists[1];
   };
-  // 1ms has passed to upload 1kb
-  // that gives us a bandwidth of 1024 / 1 * 8 * 1000 = 8192000
+
+  assert.ok(segmentByteLength, 'the segment has some number of bytes');
+
+  // 1ms for request duration
   this.clock.tick(1);
   this.masterPlaylistController.mainSegmentLoader_.mediaIndex = 0;
   // segment 0
-  this.standardXHRResponse(this.requests[2]);
+  this.standardXHRResponse(this.requests[2], segment);
+
+  await new Promise((accept, reject) => {
+    this.masterPlaylistController.mainSegmentLoader_.on('appending', accept);
+  });
+
+  // source buffers are mocked, so must manually trigger update ends on audio and video
+  // buffers
   this.masterPlaylistController.mediaSource.sourceBuffers[0].trigger('updateend');
+  this.masterPlaylistController.mediaSource.sourceBuffers[1].trigger('updateend');
+
   // media1
   this.standardXHRResponse(this.requests[3]);
   assert.ok(selectedPlaylist, 'selected playlist');
@@ -1728,14 +1737,17 @@ QUnit.test('updates the duration after switching playlists', function(assert) {
            'updates the duration');
 
   // verify stats
-  assert.equal(this.player.tech_.hls.stats.bandwidth, 8192000, 'Live stream');
+  // request duration was 1ms, giving a bandwidth of bytes / 1 * 8 * 1000
+  assert.equal(this.player.tech_.hls.stats.bandwidth,
+               segmentByteLength / 1 * 8 * 1000,
+               'stats has the right bandwidth');
   assert.equal(this.player.tech_.hls.stats.mediaRequests, 1, '1 segment request');
   assert.equal(this.player.tech_.hls.stats.mediaBytesTransferred,
-               1024,
-               '1024 bytes downloaded');
+               segmentByteLength,
+               'stats has the right number of bytes transferred');
 });
 
-QUnit.test('playlist selection uses systemBandwidth', function(assert) {
+QUnit.test('playlist selection uses systemBandwidth', async function(assert) {
   this.masterPlaylistController.mediaSource.trigger('sourceopen');
   this.player.width(1000);
   this.player.height(900);
@@ -1744,33 +1756,29 @@ QUnit.test('playlist selection uses systemBandwidth', function(assert) {
   this.standardXHRResponse(this.requests[0]);
   // media
   this.standardXHRResponse(this.requests[1]);
+
   assert.ok(/media3\.m3u8/i.test(this.requests[1].url), 'Selected the highest rendition');
 
-  // 1ms has passed to upload 1kb
-  // that gives us a bandwidth of 1024 / 1 * 8 * 1000 = 8192000
-  this.clock.tick(1);
-  this.masterPlaylistController.mainSegmentLoader_.mediaIndex = 0;
-  // segment 0
-  this.standardXHRResponse(this.requests[2]);
-  // 20ms have passed to upload 1kb
-  // that gives us a throughput of 1024 / 20 * 8 * 1000 = 409600
-  this.clock.tick(20);
-  this.masterPlaylistController.mediaSource.sourceBuffers[0].trigger('updateend');
+  await requestAndAppendSegment({
+    request: this.requests[2],
+    segment: muxedSegment(),
+    segmentLoader: this.masterPlaylistController.mainSegmentLoader_,
+    clock: this.clock,
+    bandwidth: 8192000,
+    throughput: 409600
+  });
+  // need two segments before a rendition change can happen
+  await requestAndAppendSegment({
+    request: this.requests[3],
+    segment: muxedSegment(),
+    segmentLoader: this.masterPlaylistController.mainSegmentLoader_,
+    clock: this.clock,
+    bandwidth: 8192000,
+    throughput: 409600
+  });
+
   // systemBandwidth is 1 / (1 / 8192000 + 1 / 409600) = ~390095
-
-  // media1
-  this.standardXHRResponse(this.requests[3]);
-  assert.ok(/media\.m3u8/i.test(this.requests[3].url), 'Selected the rendition < 390095');
-
-  assert.ok(this.masterPlaylistController.mediaSource.duration !== 0,
-           'updates the duration');
-
-  // verify stats
-  assert.equal(this.player.tech_.hls.stats.bandwidth, 8192000, 'Live stream');
-  assert.equal(this.player.tech_.hls.stats.mediaRequests, 1, '1 segment request');
-  assert.equal(this.player.tech_.hls.stats.mediaBytesTransferred,
-               1024,
-               '1024 bytes downloaded');
+  assert.ok(/media\.m3u8/i.test(this.requests[4].url), 'Selected the rendition < 390095');
 });
 
 QUnit.test('removes request timeout when segment timesout on lowest rendition',
@@ -2171,13 +2179,18 @@ QUnit.test('trigger events when an AES is detected', function(assert) {
   Hls.Playlist.isAes = isAesCopy;
 });
 
-QUnit.test('trigger events when an fMP4 stream is detected', function(assert) {
-  let hlsFmp4Events = 0;
-  let isFmp4Copy = Hls.Playlist.isFmp4;
+QUnit.test('trigger event when a video fMP4 stream is detected', async function(assert) {
+  // use real media sources to allow segment loader to naturally detect fmp4
+  this.mse.restore();
+  this.requests.length = 0;
+  this.player = createPlayer();
+  this.player.src({
+    src: 'prog_index.m3u8',
+    type: 'application/vnd.apple.mpegurl'
+  });
+  this.clock.tick(1);
 
-  Hls.Playlist.isFmp4 = (media) => {
-    return true;
-  };
+  let hlsFmp4Events = 0;
 
   this.player.tech_.on('usage', (event) => {
     if (event.name === 'hls-fmp4') {
@@ -2185,14 +2198,116 @@ QUnit.test('trigger events when an fMP4 stream is detected', function(assert) {
     }
   });
 
-  // master
-  this.standardXHRResponse(this.requests.shift());
+  const mpc = this.player.vhs.masterPlaylistController_;
+
+  await setupMediaSource(
+    mpc.mainSegmentLoader_.mediaSource_,
+    mpc.mainSegmentLoader_.sourceUpdater_,
+    {
+      videoEl: this.player.tech_.el_,
+      isVideoOnly: true
+    }
+  );
+
   // media
   this.standardXHRResponse(this.requests.shift());
-  this.masterPlaylistController.mediaSource.trigger('sourceopen');
+
+  assert.equal(hlsFmp4Events, 0, 'an fMP4 stream is not detected');
+
+  const initSegmentRequest = this.requests.shift();
+  const segmentRequest = this.requests.shift();
+
+  await requestAndAppendSegment({
+    request: segmentRequest,
+    initSegmentRequest,
+    segmentLoader: mpc.mainSegmentLoader_,
+    initSegment: mp4VideoInitSegment(),
+    segment: mp4VideoSegment(),
+    isOnlyVideo: true,
+    clock: this.clock
+  });
 
   assert.equal(hlsFmp4Events, 1, 'an fMP4 stream is detected');
-  Hls.Playlist.isFmp4 = isFmp4Copy;
+});
+
+QUnit.test('only triggers a single fmp4 usage event', async function(assert) {
+  let hlsFmp4Events = 0;
+
+  this.player.tech_.on('usage', (event) => {
+    if (event.name === 'hls-fmp4') {
+      hlsFmp4Events++;
+    }
+  });
+
+  const mainSegmentLoader = this.player.vhs.masterPlaylistController_.mainSegmentLoader_;
+
+  mainSegmentLoader.trigger('fmp4');
+
+  assert.equal(hlsFmp4Events, 1, 'fired fMP4 usage event');
+
+  mainSegmentLoader.trigger('fmp4');
+
+  assert.equal(hlsFmp4Events, 1, 'did not fire usage event');
+
+  const audioSegmentLoader =
+    this.player.vhs.masterPlaylistController_.audioSegmentLoader_;
+
+  audioSegmentLoader.trigger('fmp4');
+
+  assert.equal(hlsFmp4Events, 1, 'did not fire usage event');
+});
+
+// TODO currently this test is skipped because audio only fmp4 isn't supported. Once
+// support is added, this test can be unskipped.
+QUnit.skip('trigger event when an audio fMP4 stream is detected', async function(assert) {
+  // use real media sources to allow segment loader to naturally detect fmp4
+  this.mse.restore();
+  this.requests.length = 0;
+  this.player = createPlayer();
+  this.player.src({
+    src: 'prog_index.m3u8',
+    type: 'application/vnd.apple.mpegurl'
+  });
+  this.clock.tick(1);
+
+  let hlsFmp4Events = 0;
+
+  this.player.tech_.on('usage', (event) => {
+    if (event.name === 'hls-fmp4') {
+      hlsFmp4Events++;
+    }
+  });
+
+  const mpc = this.player.vhs.masterPlaylistController_;
+
+  await setupMediaSource(
+    mpc.mainSegmentLoader_.mediaSource_,
+    mpc.mainSegmentLoader_.sourceUpdater_,
+    {
+      videoEl: this.player.tech_.el_,
+      isAudioOnly: true
+    }
+  );
+
+  // media
+  this.standardXHRResponse(this.requests.shift());
+
+  assert.equal(hlsFmp4Events, 0, 'an fMP4 stream is not detected');
+
+  const initSegmentRequest = this.requests.shift();
+  const segmentRequest = this.requests.shift();
+
+  await requestAndAppendSegment({
+    request: segmentRequest,
+    initSegmentRequest,
+    segmentLoader: mpc.mainSegmentLoader_,
+    initSegment: mp4AudioInitSegment(),
+    segment: mp4AudioSegment(),
+    isOnlyAudio: true,
+    clock: this.clock
+  });
+
+  assert.equal(hlsFmp4Events, 1, 'an fMP4 stream is detected');
 });
 
 QUnit.test('adds only CEA608 closed-caption tracks when a master playlist is loaded',
@@ -2330,6 +2445,8 @@ QUnit.test('switches off subtitles on subtitle errors', function(assert) {
   // master, contains media groups for subtitles
   this.standardXHRResponse(this.requests.shift());
   // media
+  this.standardXHRResponse(this.requests.shift());
+  // media segment
   this.standardXHRResponse(this.requests.shift());
 
   const textTracks = this.player.textTracks();
@@ -2595,7 +2712,9 @@ QUnit.test('calculates dynamic GOAL_BUFFER_LENGTH', function(assert) {
   assert.equal(mpc.goalBufferLength(), 60, 'dynamic GBL continues to use max value');
 
   // restore config
-  Object.keys(configOld).forEach((key) => Config[key] = configOld[key]);
+  Object.keys(configOld).forEach((key) => {
+    Config[key] = configOld[key];
+  });
 });
 
 QUnit.test('calculates dynamic BUFFER_LOW_WATER_LINE', function(assert) {
@@ -2630,10 +2749,14 @@ QUnit.test('calculates dynamic BUFFER_LOW_WATER_LINE', function(assert) {
   assert.equal(mpc.bufferLowWaterLine(), 30, 'dynamic BLWL continues to use max value');
 
   // restore config
-  Object.keys(configOld).forEach((key) => Config[key] = configOld[key]);
+  Object.keys(configOld).forEach((key) => {
+    Config[key] = configOld[key];
+  });
 });
 
-QUnit.test('properly configures loader mime types', function(assert) {
+QUnit.test('creates source buffers after first main segment if muxed content',
+async function(assert) {
+  this.requests.length = 0;
   this.player = createPlayer();
   this.player.src({
     src: 'manifest/master.m3u8',
@@ -2641,90 +2764,594 @@ QUnit.test('properly configures loader mime types', function(assert) {
   });
   this.clock.tick(1);
 
-  const masterPlaylistController = this.player.tech_.hls.masterPlaylistController_;
-  const mainMimeTypeCalls = [];
-  const audioMimeTypeCalls = [];
+  const createSourceBufferCalls = [];
+  const mpc = this.player.vhs.masterPlaylistController_;
+  const origCreateSourceBuffers =
+    mpc.sourceUpdater_.createSourceBuffers.bind(mpc.sourceUpdater_);
 
-  masterPlaylistController.mainSegmentLoader_.mimeType = (mimeType, emitter) => {
-    mainMimeTypeCalls.push([mimeType, emitter]);
+  mpc.sourceUpdater_.createSourceBuffers = (codecs) => {
+    createSourceBufferCalls.push(codecs);
+    origCreateSourceBuffers(codecs);
   };
-  masterPlaylistController.audioSegmentLoader_.mimeType = (mimeType, emitter) => {
-    audioMimeTypeCalls.push([mimeType, emitter]);
+
+  openMediaSource(this.player, this.clock);
+
+  // master
+  this.standardXHRResponse(this.requests.shift());
+  // media
+  this.standardXHRResponse(this.requests.shift());
+
+  assert.equal(createSourceBufferCalls.length, 0, 'have not created source buffers yet');
+
+  await requestAndAppendSegment({
+    request: this.requests.shift(),
+    segmentLoader: mpc.mainSegmentLoader_,
+    clock: this.clock
+  });
+
+  assert.equal(createSourceBufferCalls.length, 1, 'called to create source buffers');
+  assert.deepEqual(
+    createSourceBufferCalls[0],
+    {
+      audio: DEFAULT_AUDIO_CODEC,
+      video: DEFAULT_VIDEO_CODEC
+    },
+    'passed default codecs');
+});
+
+QUnit.test('creates source buffers after first main segment if audio only',
+async function(assert) {
+  this.requests.length = 0;
+  this.player = createPlayer();
+  this.player.src({
+    src: 'manifest/master.m3u8',
+    type: 'application/vnd.apple.mpegurl'
+  });
+  this.clock.tick(1);
+
+  const createSourceBufferCalls = [];
+  const mpc = this.player.vhs.masterPlaylistController_;
+  const origCreateSourceBuffers =
+    mpc.sourceUpdater_.createSourceBuffers.bind(mpc.sourceUpdater_);
+
+  mpc.sourceUpdater_.createSourceBuffers = (codecs) => {
+    createSourceBufferCalls.push(codecs);
+    origCreateSourceBuffers(codecs);
   };
 
-  masterPlaylistController.configureLoaderMimeTypes_([
-    'video/mp4; codecs="avc1.deadbeef"'
-  ]);
+  openMediaSource(this.player, this.clock);
 
-  assert.equal(mainMimeTypeCalls.length, 1, 'configured main segment loader');
-  assert.equal(mainMimeTypeCalls[0][0],
-               'video/mp4; codecs="avc1.deadbeef"',
-               'correct mime type for main segment loader');
-  assert.notOk(mainMimeTypeCalls[0][1], 'no source buffer emitter');
-  assert.equal(audioMimeTypeCalls.length, 0, 'did not configure audio segment loader');
+  // master
+  this.standardXHRResponse(this.requests.shift());
+  // media
+  this.standardXHRResponse(this.requests.shift());
 
-  mainMimeTypeCalls.length = 0;
+  assert.equal(createSourceBufferCalls.length, 0, 'have not created source buffers yet');
 
-  masterPlaylistController.configureLoaderMimeTypes_([
-    'audio/mp4; codecs="mp4a.40.E"'
-  ]);
+  await requestAndAppendSegment({
+    request: this.requests.shift(),
+    segmentLoader: mpc.mainSegmentLoader_,
+    segment: audioSegment(),
+    isOnlyAudio: true,
+    clock: this.clock
+  });
 
-  assert.equal(mainMimeTypeCalls.length, 1, 'configured main segment loader');
-  assert.equal(mainMimeTypeCalls[0][0],
-               'audio/mp4; codecs="mp4a.40.E"',
-               'correct mime type for main segment loader');
-  assert.notOk(mainMimeTypeCalls[0][1], 'no source buffer emitter');
-  assert.equal(audioMimeTypeCalls.length, 0, 'did not configure audio segment loader');
+  assert.equal(createSourceBufferCalls.length, 1, 'called to create source buffers');
+  assert.deepEqual(
+    createSourceBufferCalls[0],
+    {
+      audio: DEFAULT_AUDIO_CODEC
+    },
+    'passed default audio codec');
+});
 
-  mainMimeTypeCalls.length = 0;
+QUnit.test('creates source buffers after first main segment if video only',
+async function(assert) {
+  this.requests.length = 0;
+  this.player = createPlayer();
+  this.player.src({
+    src: 'manifest/master.m3u8',
+    type: 'application/vnd.apple.mpegurl'
+  });
+  this.clock.tick(1);
 
-  masterPlaylistController.configureLoaderMimeTypes_([
-    'video/mp4; codecs="avc1.deadbeef, mp4a.40.E"'
-  ]);
+  const createSourceBufferCalls = [];
+  const mpc = this.player.vhs.masterPlaylistController_;
+  const origCreateSourceBuffers =
+    mpc.sourceUpdater_.createSourceBuffers.bind(mpc.sourceUpdater_);
 
-  assert.equal(mainMimeTypeCalls.length, 1, 'configured main segment loader');
-  assert.equal(mainMimeTypeCalls[0][0],
-               'video/mp4; codecs="avc1.deadbeef, mp4a.40.E"',
-               'correct mime type for main segment loader');
-  assert.notOk(mainMimeTypeCalls[0][1], 'no source buffer emitter');
-  assert.equal(audioMimeTypeCalls.length, 0, 'did not configure audio segment loader');
+  mpc.sourceUpdater_.createSourceBuffers = (codecs) => {
+    createSourceBufferCalls.push(codecs);
+    origCreateSourceBuffers(codecs);
+  };
 
-  mainMimeTypeCalls.length = 0;
+  openMediaSource(this.player, this.clock);
 
-  masterPlaylistController.configureLoaderMimeTypes_([
-    'video/mp4; codecs="avc1.deadbeef"',
-    'audio/mp4; codecs="mp4a.40.E"'
-  ]);
+  // master
+  this.standardXHRResponse(this.requests.shift());
+  // media
+  this.standardXHRResponse(this.requests.shift());
 
-  assert.equal(mainMimeTypeCalls.length, 1, 'configured main segment loader');
-  assert.equal(mainMimeTypeCalls[0][0],
-               'video/mp4; codecs="avc1.deadbeef"',
-               'correct mime type for main segment loader');
-  assert.ok(mainMimeTypeCalls[0][1] instanceof videojs.EventTarget,
-            'passed a source buffer emitter to main segment loader');
-  assert.equal(audioMimeTypeCalls.length, 1, 'configured audio segment loader');
-  assert.equal(audioMimeTypeCalls[0][0],
-               'audio/mp4; codecs="mp4a.40.E"',
-               'correct mime type for audio segment loader');
-  assert.ok(audioMimeTypeCalls[0][1] instanceof videojs.EventTarget,
-            'passed a source buffer emitter to audio segment loader');
+  assert.equal(createSourceBufferCalls.length, 0, 'have not created source buffers yet');
 
-  mainMimeTypeCalls.length = 0;
-  audioMimeTypeCalls.length = 0;
+  await requestAndAppendSegment({
+    request: this.requests.shift(),
+    segmentLoader: mpc.mainSegmentLoader_,
+    segment: videoSegment(),
+    isOnlyVideo: true,
+    clock: this.clock
+  });
 
-  masterPlaylistController.configureLoaderMimeTypes_([
-    'audio/mp4; codecs="mp4a.40.E"',
-    'audio/mp4; codecs="mp4a.40.E"'
-  ]);
+  assert.equal(createSourceBufferCalls.length, 1, 'called to create source buffers');
+  assert.deepEqual(
+    createSourceBufferCalls[0],
+    {
+      video: DEFAULT_VIDEO_CODEC
+    },
+    'passed default video codec');
+});
 
-  assert.equal(mainMimeTypeCalls.length, 1, 'configured main segment loader');
-  assert.equal(mainMimeTypeCalls[0][0], 'audio/mp4; codecs="mp4a.40.E"',
-    'correct mime type for main segment loader');
-  assert.notOk(mainMimeTypeCalls[0][1], 'no source buffer emitter');
-  assert.equal(audioMimeTypeCalls.length, 1, 'configured audio segment loader');
-  assert.equal(audioMimeTypeCalls[0][0], 'audio/mp4; codecs="mp4a.40.E"',
-    'correct mime type for audio segment loader');
-  assert.notOk(audioMimeTypeCalls[0][1], 'no source buffer emitter');
+// Right now we only get codec information from the manifest, not the content itself. As
+// such, if there's alternate audio, we know it'll either use the manifest provided codec
+// info or the default. Either way, we don't need to wait for the audio segment to create
+// the source buffers.
+QUnit.test('creates source buffers after first main segment if demuxed',
+async function(assert) {
+  this.requests.length = 0;
+  this.player = createPlayer();
+  this.player.src({
+    src: 'manifest/master.m3u8',
+    type: 'application/vnd.apple.mpegurl'
+  });
+  this.clock.tick(1);
+
+  const createSourceBufferCalls = [];
+  const mpc = this.player.vhs.masterPlaylistController_;
+  const origCreateSourceBuffers =
+    mpc.sourceUpdater_.createSourceBuffers.bind(mpc.sourceUpdater_);
+
+  mpc.sourceUpdater_.createSourceBuffers = (codecs) => {
+    createSourceBufferCalls.push(codecs);
+    origCreateSourceBuffers(codecs);
+  };
+
+  openMediaSource(this.player, this.clock);
+
+  // master
+  this.requests.shift().respond(
+    200,
+    null,
+    '#EXTM3U\n' +
+    '#EXT-X-VERSION:4\n' +
+    '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="en",DEFAULT=YES,AUTOSELECT=YES,' +
+      'LANGUAGE="en",URI="audio.m3u8"\n' +
+    '#EXT-X-STREAM-INF:PROGRAM-ID=1,BANDWIDTH=1,AUDIO="audio"\n' +
+    'media.m3u8\n');
+  // video media
+  this.standardXHRResponse(this.requests.shift());
+  // audio media
+  this.standardXHRResponse(this.requests.shift());
+
+  assert.equal(createSourceBufferCalls.length, 0, 'have not created source buffers yet');
+
+  await requestAndAppendSegment({
+    request: this.requests.shift(),
+    segmentLoader: mpc.mainSegmentLoader_,
+    segment: videoSegment(),
+    isOnlyVideo: true,
+    clock: this.clock
+  });
+
+  assert.equal(createSourceBufferCalls.length, 1, 'called to create source buffers');
+  assert.deepEqual(
+    createSourceBufferCalls[0],
+    {
+      video: DEFAULT_VIDEO_CODEC,
+      audio: DEFAULT_AUDIO_CODEC
+    },
+    'passed default codecs');
+});
+
+QUnit.test('uses codec info from manifest for source buffer creation',
+async function(assert) {
+  this.requests.length = 0;
+  this.player = createPlayer();
+  this.player.src({
+    src: 'manifest/master.m3u8',
+    type: 'application/vnd.apple.mpegurl'
+  });
+  this.clock.tick(1);
+
+  const createSourceBufferCalls = [];
+  const mpc = this.player.vhs.masterPlaylistController_;
+  const origCreateSourceBuffers =
+    mpc.sourceUpdater_.createSourceBuffers.bind(mpc.sourceUpdater_);
+
+  mpc.sourceUpdater_.createSourceBuffers = (codecs) => {
+    createSourceBufferCalls.push(codecs);
+    origCreateSourceBuffers(codecs);
+  };
+
+  openMediaSource(this.player, this.clock);
+
+  // master
+  this.requests.shift().respond(
+    200,
+    null,
+    '#EXTM3U\n' +
+    '#EXT-X-VERSION:4\n' +
+    '#EXT-X-STREAM-INF:PROGRAM-ID=1,BANDWIDTH=1,CODECS="mp4a.40.e, avc1.deadbeef"\n' +
+    'media.m3u8\n');
+  // media
+  this.standardXHRResponse(this.requests.shift());
+  await requestAndAppendSegment({
+    request: this.requests.shift(),
+    segmentLoader: mpc.mainSegmentLoader_,
+    clock: this.clock
+  });
+
+  assert.equal(createSourceBufferCalls.length, 1, 'called to create source buffers');
+  assert.deepEqual(
+    createSourceBufferCalls[0],
+    {
+      audio: 'mp4a.40.e',
+      video: 'avc1.deadbeef'
+    },
+    'passed manifest specified codecs');
+});
+
+QUnit.test('translates old-school apple codec strings from manifest to modern standard ' +
+'for source buffer creation',
+async function(assert) {
+  this.requests.length = 0;
+  this.player = createPlayer();
+  this.player.src({
+    src: 'manifest/master.m3u8',
+    type: 'application/vnd.apple.mpegurl'
+  });
+  this.clock.tick(1);
+
+  const createSourceBufferCalls = [];
+  const mpc = this.player.vhs.masterPlaylistController_;
+  const origCreateSourceBuffers =
+    mpc.sourceUpdater_.createSourceBuffers.bind(mpc.sourceUpdater_);
+
+  mpc.sourceUpdater_.createSourceBuffers = (codecs) => {
+    createSourceBufferCalls.push(codecs);
+    origCreateSourceBuffers(codecs);
+  };
+
+  openMediaSource(this.player, this.clock);
+
+  // master
+  this.requests.shift().respond(
+    200,
+    null,
+    '#EXTM3U\n' +
+    '#EXT-X-VERSION:4\n' +
+    '#EXT-X-STREAM-INF:PROGRAM-ID=1,BANDWIDTH=1,CODECS="avc1.100.31,mp4a.40.5"\n' +
+    'media.m3u8\n');
+  // media
+  this.standardXHRResponse(this.requests.shift());
+  await requestAndAppendSegment({
+    request: this.requests.shift(),
+    segmentLoader: mpc.mainSegmentLoader_,
+    clock: this.clock
+  });
+
+  assert.equal(createSourceBufferCalls.length, 1, 'called to create source buffers');
+  assert.deepEqual(
+    createSourceBufferCalls[0],
+    {
+      audio: 'mp4a.40.5',
+      video: 'avc1.64001f'
+    },
+    'translated to modern codec strings');
+});
+
+QUnit.test('uses default codec strings when provided are invalid',
+async function(assert) {
+  this.requests.length = 0;
+  this.player = createPlayer();
+  this.player.src({
+    src: 'manifest/master.m3u8',
+    type: 'application/vnd.apple.mpegurl'
+  });
+  this.clock.tick(1);
+
+  const createSourceBufferCalls = [];
+  const mpc = this.player.vhs.masterPlaylistController_;
+  const origCreateSourceBuffers =
+    mpc.sourceUpdater_.createSourceBuffers.bind(mpc.sourceUpdater_);
+
+  mpc.sourceUpdater_.createSourceBuffers = (codecs) => {
+    createSourceBufferCalls.push(codecs);
+    origCreateSourceBuffers(codecs);
+  };
+
+  openMediaSource(this.player, this.clock);
+
+  // master
+  this.requests.shift().respond(
+    200,
+    null,
+    '#EXTM3U\n' +
+    '#EXT-X-VERSION:4\n' +
+    '#EXT-X-STREAM-INF:PROGRAM-ID=1,BANDWIDTH=1,CODECS="nope"\n' +
+    'media.m3u8\n');
+  // media
+  this.standardXHRResponse(this.requests.shift());
+  await requestAndAppendSegment({
+    request: this.requests.shift(),
+    segmentLoader: mpc.mainSegmentLoader_,
+    clock: this.clock
+  });
+
+  assert.equal(createSourceBufferCalls.length, 1, 'called to create source buffers');
+  assert.deepEqual(
+    createSourceBufferCalls[0],
+    {
+      audio: 'mp4a.40.2',
+      video: 'avc1.4d400d'
+    },
+    'used default codec strings');
+});
+
+QUnit.test('uses codec info from manifest for source buffer creation even when demuxed',
+async function(assert) {
+  this.requests.length = 0;
+  this.player = createPlayer();
+  this.player.src({
+    src: 'manifest/master.m3u8',
+    type: 'application/vnd.apple.mpegurl'
+  });
+  this.clock.tick(1);
+
+  const createSourceBufferCalls = [];
+  const mpc = this.player.vhs.masterPlaylistController_;
+  const origCreateSourceBuffers =
+    mpc.sourceUpdater_.createSourceBuffers.bind(mpc.sourceUpdater_);
+
+  mpc.sourceUpdater_.createSourceBuffers = (codecs) => {
+    createSourceBufferCalls.push(codecs);
+    origCreateSourceBuffers(codecs);
+  };
+
+  openMediaSource(this.player, this.clock);
+
+  // master
+  this.requests.shift().respond(
+    200,
+    null,
+    '#EXTM3U\n' +
+    '#EXT-X-VERSION:4\n' +
+    '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="en",DEFAULT=YES,AUTOSELECT=YES,' +
+      'LANGUAGE="en",URI="audio.m3u8"\n' +
+    '#EXT-X-STREAM-INF:PROGRAM-ID=1,BANDWIDTH=1,AUDIO="audio",' +
+      'CODECS="mp4a.40.e, avc1.deadbeef"\n' +
+    'media.m3u8\n');
+  // video media
+  this.standardXHRResponse(this.requests.shift());
+  // audio media
+  this.standardXHRResponse(this.requests.shift());
+  await requestAndAppendSegment({
+    request: this.requests.shift(),
+    segment: videoSegment(),
+    isOnlyVideo: true,
+    segmentLoader: mpc.mainSegmentLoader_,
+    clock: this.clock
+  });
+
+  assert.equal(createSourceBufferCalls.length, 1, 'called to create source buffers');
+  assert.deepEqual(
+    createSourceBufferCalls[0],
+    {
+      audio: 'mp4a.40.e',
+      video: 'avc1.deadbeef'
+    },
+    'passed manifest specified codecs');
+});
+
+QUnit.test('uses codec info from manifest for source buffer creation for audio only',
+async function(assert) {
+  this.requests.length = 0;
+  this.player = createPlayer();
+  this.player.src({
+    src: 'manifest/master.m3u8',
+    type: 'application/vnd.apple.mpegurl'
+  });
+  this.clock.tick(1);
+
+  const createSourceBufferCalls = [];
+  const mpc = this.player.vhs.masterPlaylistController_;
+  const origCreateSourceBuffers =
+    mpc.sourceUpdater_.createSourceBuffers.bind(mpc.sourceUpdater_);
+
+  mpc.sourceUpdater_.createSourceBuffers = (codecs) => {
+    createSourceBufferCalls.push(codecs);
+    origCreateSourceBuffers(codecs);
+  };
+
+  openMediaSource(this.player, this.clock);
+
+  // master
+  this.requests.shift().respond(
+    200,
+    null,
+    '#EXTM3U\n' +
+    '#EXT-X-VERSION:4\n' +
+    '#EXT-X-STREAM-INF:PROGRAM-ID=1,BANDWIDTH=1,CODECS="mp4a.40.e"\n' +
+    'media.m3u8\n');
+  // media
+  this.standardXHRResponse(this.requests.shift());
+  await requestAndAppendSegment({
+    request: this.requests.shift(),
+    segment: audioSegment(),
+    isOnlyAudio: true,
+    segmentLoader: mpc.mainSegmentLoader_,
+    clock: this.clock
+  });
+
+  assert.equal(createSourceBufferCalls.length, 1, 'called to create source buffers');
+  assert.deepEqual(
+    createSourceBufferCalls[0],
+    {
+      audio: 'mp4a.40.e'
+    },
+    'passed manifest specified audio codec');
+});
+
+QUnit.test('uses codec info from manifest for source buffer creation for video only',
+async function(assert) {
+  this.requests.length = 0;
+  this.player = createPlayer();
+  this.player.src({
+    src: 'manifest/master.m3u8',
+    type: 'application/vnd.apple.mpegurl'
+  });
+  this.clock.tick(1);
+
+  const createSourceBufferCalls = [];
+  const mpc = this.player.vhs.masterPlaylistController_;
+  const origCreateSourceBuffers =
+    mpc.sourceUpdater_.createSourceBuffers.bind(mpc.sourceUpdater_);
+
+  mpc.sourceUpdater_.createSourceBuffers = (codecs) => {
+    createSourceBufferCalls.push(codecs);
+    origCreateSourceBuffers(codecs);
+  };
+
+  openMediaSource(this.player, this.clock);
+
+  // master
+  this.requests.shift().respond(
+    200,
+    null,
+    '#EXTM3U\n' +
+    '#EXT-X-VERSION:4\n' +
+    '#EXT-X-STREAM-INF:PROGRAM-ID=1,BANDWIDTH=1,CODECS="avc1.deadbeef"\n' +
+    'media.m3u8\n');
+  // media
+  this.standardXHRResponse(this.requests.shift());
+  await requestAndAppendSegment({
+    request: this.requests.shift(),
+    segment: videoSegment(),
+    isOnlyVideo: true,
+    segmentLoader: mpc.mainSegmentLoader_,
+    clock: this.clock
+  });
+
+  assert.equal(createSourceBufferCalls.length, 1, 'called to create source buffers');
+  assert.deepEqual(
+    createSourceBufferCalls[0],
+    {
+      video: 'avc1.deadbeef'
+    },
+    'passed manifest specified video codec');
+});
+
+// Technically, the HLS spec at least requires that the user provide all codec info if
+// they supply a CODEC attribute. However, we can be a little more flexible in some cases.
+QUnit.test('uses available audio codec info from manifest plus video default for source' +
+'buffer creation if content looks different from codec info', async function(assert) {
+  this.requests.length = 0;
+  this.player = createPlayer();
+  this.player.src({
+    src: 'manifest/master.m3u8',
+    type: 'application/vnd.apple.mpegurl'
+  });
+  this.clock.tick(1);
+
+  const createSourceBufferCalls = [];
+  const mpc = this.player.vhs.masterPlaylistController_;
+  const origCreateSourceBuffers =
+    mpc.sourceUpdater_.createSourceBuffers.bind(mpc.sourceUpdater_);
+
+  mpc.sourceUpdater_.createSourceBuffers = (codecs) => {
+    createSourceBufferCalls.push(codecs);
+    origCreateSourceBuffers(codecs);
+  };
+
+  openMediaSource(this.player, this.clock);
+
+  // master
+  this.requests.shift().respond(
+    200,
+    null,
+    '#EXTM3U\n' +
+    '#EXT-X-VERSION:4\n' +
+    // CODECS specify audio only
+    '#EXT-X-STREAM-INF:PROGRAM-ID=1,BANDWIDTH=1,CODECS="mp4a.40.e"\n' +
+    'media.m3u8\n');
+  // media
+  this.standardXHRResponse(this.requests.shift());
+  // segment with both audio and video
+  await requestAndAppendSegment({
+    request: this.requests.shift(),
+    segmentLoader: mpc.mainSegmentLoader_,
+    clock: this.clock
+  });
+
+  assert.equal(createSourceBufferCalls.length, 1, 'called to create source buffers');
+  assert.deepEqual(
+    createSourceBufferCalls[0],
+    {
+      audio: 'mp4a.40.e',
+      video: DEFAULT_VIDEO_CODEC
+    },
+    'passed manifest specified codecs and used default');
+});
+
+// Technically, the HLS spec at least requires that the user provide all codec info if
+// they supply a CODEC attribute. However, we can be a little more flexible in some cases.
+QUnit.test('uses available video codec info from manifest plus audio default for source' +
+'buffer creation if content looks different from codec info', async function(assert) {
+  this.requests.length = 0;
+  this.player = createPlayer();
+  this.player.src({
+    src: 'manifest/master.m3u8',
+    type: 'application/vnd.apple.mpegurl'
+  });
+  this.clock.tick(1);
+
+  const createSourceBufferCalls = [];
+  const mpc = this.player.vhs.masterPlaylistController_;
+  const origCreateSourceBuffers =
+    mpc.sourceUpdater_.createSourceBuffers.bind(mpc.sourceUpdater_);
+
+  mpc.sourceUpdater_.createSourceBuffers = (codecs) => {
+    createSourceBufferCalls.push(codecs);
+    origCreateSourceBuffers(codecs);
+  };
+
+  openMediaSource(this.player, this.clock);
+
+  // master
+  this.requests.shift().respond(
+    200,
+    null,
+    '#EXTM3U\n' +
+    '#EXT-X-VERSION:4\n' +
+    // CODECS specify video only
+    '#EXT-X-STREAM-INF:PROGRAM-ID=1,BANDWIDTH=1,CODECS="avc1.deadbeef"\n' +
+    'media.m3u8\n');
+  // media
+  this.standardXHRResponse(this.requests.shift());
+  // segment with both audio and video
+  await requestAndAppendSegment({
+    request: this.requests.shift(),
+    segmentLoader: mpc.mainSegmentLoader_,
+    clock: this.clock
+  });
+
+  assert.equal(createSourceBufferCalls.length, 1, 'called to create source buffers');
+  assert.deepEqual(
+    createSourceBufferCalls[0],
+    {
+      audio: DEFAULT_AUDIO_CODEC,
+      video: 'avc1.deadbeef'
+    },
+    'passed manifest specified codecs and used default');
 });
 
 QUnit.test('Exception in play promise should be caught', function(assert) {
@@ -2734,10 +3361,124 @@ QUnit.test('Exception in play promise should be caught', function(assert) {
   mpc.tech_ = {
     autoplay: () => true,
     play: () => new Promise(function(resolve, reject) {
-      reject(new DOMException());
+      reject(new window.DOMException());
     })
   };
   mpc.handleSourceOpen_();
 
   assert.ok(true, 'rejects dom exception');
+});
+
+QUnit.test('adds duration to media source after loading playlist', function(assert) {
+  openMediaSource(this.player, this.clock);
+  const mpc = this.masterPlaylistController;
+
+  // master
+  this.standardXHRResponse(this.requests.shift());
+
+  assert.notOk(mpc.mediaSource.duration, 'no duration set on media source');
+
+  // playlist
+  this.standardXHRResponse(this.requests.shift());
+
+  assert.equal(mpc.mediaSource.duration, 40, 'duration set on media source');
+});
+
+QUnit.test('live playlist reports infinite duration', function(assert) {
+  openMediaSource(this.player, this.clock);
+  const mpc = this.masterPlaylistController;
+
+  // master
+  this.standardXHRResponse(this.requests.shift());
+
+  assert.notOk(mpc.mediaSource.duration, 'no duration set on media source');
+
+  this.requests.shift().respond(200, null,
+                                '#EXTM3U\n' +
+                                '#EXTINF:5.0\n' +
+                                '0.ts\n');
+
+  assert.equal(mpc.duration(), Infinity, 'duration reported as infinite');
+});
+
+QUnit.test('live playlist sets duration of media source to seekable end',
+function(assert) {
+  openMediaSource(this.player, this.clock);
+  const mpc = this.masterPlaylistController;
+
+  // master
+  this.standardXHRResponse(this.requests.shift());
+
+  assert.notOk(mpc.mediaSource.duration, 'no duration set on media source');
+
+  // since the safe live end will be 3 target durations back, in order for there to be a
+  // positive seekable end, there should be at least 4 segments
+  this.requests.shift().respond(200, null, `
+		#EXTM3U
+		#EXT-X-TARGETDURATION:5
+		#EXTINF:5
+		0.ts
+		#EXTINF:5
+		1.ts
+		#EXTINF:5
+		2.ts
+		#EXTINF:5
+		3.ts
+  `);
+
+  assert.equal(mpc.seekable().end(0), 5, 'calculated seekable end');
+  assert.equal(
+    mpc.mediaSource.duration,
+    5,
+    'native media source duration set to seekable end');
+});
+
+QUnit.test('VOD playlist sets duration of media source to calculated playlist duration',
+function(assert) {
+  openMediaSource(this.player, this.clock);
+  const mpc = this.masterPlaylistController;
+
+  // master
+  this.standardXHRResponse(this.requests.shift());
+
+  assert.notOk(mpc.mediaSource.duration, 'no duration set on media source');
+
+  this.requests.shift().respond(200, null, `
+		#EXTM3U
+		#EXT-X-TARGETDURATION:5
+		#EXTINF:5
+		0.ts
+		#EXTINF:5
+		1.ts
+    #EXT-X-ENDLIST
+  `);
+
+  assert.equal(mpc.mediaSource.duration, 10, 'media source duration set to 10');
+});
+
+QUnit.test(
+'VOD playlist sets duration of media source to buffered end if greater than calculated ' +
+'playlist duration',
+function(assert) {
+  openMediaSource(this.player, this.clock);
+  const mpc = this.masterPlaylistController;
+
+  this.player.tech_.buffered = () => videojs.createTimeRanges([[0, 11]]);
+
+  // master
+  this.standardXHRResponse(this.requests.shift());
+
+  assert.notOk(mpc.mediaSource.duration, 'no duration set on media source');
+
+  this.requests.shift().respond(200, null, `
+		#EXTM3U
+		#EXT-X-TARGETDURATION:5
+		#EXTINF:5
+		0.ts
+		#EXTINF:5
+		1.ts
+    #EXT-X-ENDLIST
+  `);
+
+  assert.equal(mpc.mediaSource.duration, 11, 'media source duration set to 11');
 });

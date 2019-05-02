@@ -76,13 +76,6 @@ export const initSegmentId = function(initSegment) {
 };
 
 /**
- * Returns a unique string identifier for a media segment key.
- */
-export const segmentKeyId = function(key) {
-  return key.resolvedUri;
-};
-
-/**
  * utils to help dump binary data to the console
  */
 export const hexDump = (data) => {
