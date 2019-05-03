@@ -826,3 +826,4 @@ npm run <command>
 [issue-stats-issues-icon]: http://issuestats.com/github/videojs/http-streaming/badge/issue
 [greenkeeper-icon]: https://badges.greenkeeper.io/videojs/http-streaming.svg
 [greenkeeper-link]: https://greenkeeper.io/
+
